@@ -635,7 +635,7 @@ struct OrderingSectionView: View {
                 orderingPicker(
                     NSLocalizedString("Group apps", comment: ""),
                     baseName: "showAppsOrWindows",
-                    allCases: ShowAppsOrWindowsPreference.allCases
+                    allCases: GroupAppsPreference.allCases
                 )
                 Divider().padding(.leading, 10)
                 orderingPicker(
