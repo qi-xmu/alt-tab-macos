@@ -48,7 +48,7 @@ class App: AppCenterApplication {
     static var updaterController: SPUStandardUpdaterController?
     // don't queue multiple delayed rebuildUi() calls
     private static var delayedDisplayScheduled = 0
-    private static let refreshOpenUiThrottler = Throttler(delayInMs: 200)
+    private static let switcherUiRefreshThrottler = Throttler(delayInMs: 200)
 
     override init() {
         super.init()
@@ -84,11 +84,11 @@ class App: AppCenterApplication {
         ContextMenuEvents.toggle(false)
         CursorEvents.toggle(false)
         TrackpadEvents.reset()
+        Tooltips.hideAll()
         hideTilesPanelWithoutChangingKeyWindow()
         if !keepPreview {
             PreviewPanel.shared.orderOut(nil)
         }
-        Tooltips.hideAll()
         MainMenu.toggle(true)
         ProTransitionManager.shared.onSwitcherDismissed()
     }
@@ -346,16 +346,9 @@ class App: AppCenterApplication {
         CGWarpMouseCursorPosition(point)
     }
 
-    static func refreshOpenUiAfterExternalEvent(
-        _ windowsToScreenshot: [Window],
-        windowRemoved: Bool = false
-    ) {
-        WindowThumbnails.refreshAsync(
-            windowsToScreenshot,
-            .refreshUiAfterExternalEvent,
-            windowRemoved: windowRemoved
-        )
-        refreshOpenUiThrottler.throttleOrProceed {
+    static func refreshOpenUiAfterExternalEvent(_ windowsToScreenshot: [Window], windowRemoved: Bool = false) {
+        WindowThumbnails.refreshAsync(windowsToScreenshot, .refreshUiAfterExternalEvent, windowRemoved: windowRemoved)
+        switcherUiRefreshThrottler.throttleOrProceed {
             guard SwitcherSession.isActive else { return }
             if !Windows.updatesBeforeShowing() {
                 hideUi()
@@ -480,17 +473,10 @@ class App: AppCenterApplication {
         _ activeApp: Application?
     ) {
         let app = activeWindow?.application ?? activeApp!
-        let shortcutsShouldBeDisabled = Preferences.exceptions.contains {
-            exception in
-            if let id = app.bundleIdentifier {
-                return !exception.bundleIdentifier.isEmpty
-                    && id.hasPrefix(exception.bundleIdentifier)
-                    && (exception.ignore == .always
-                        || (exception.ignore == .whenFullscreen
-                            && (activeWindow?.isFullscreen ?? false)))
-            }
-            return false
-        }
+        let shortcutsShouldBeDisabled = ExceptionMatcher.disablesShortcuts(
+            app.state,
+            isFullscreen: activeWindow?.isFullscreen ?? false,
+            exceptions: Preferences.exceptions)
         KeyboardEvents.toggleGlobalShortcuts(shortcutsShouldBeDisabled)
         if shortcutsShouldBeDisabled && SwitcherSession.isActive {
             hideUi()
@@ -537,9 +523,10 @@ class App: AppCenterApplication {
             showSettingsWindow()
         }
         #if DEBUG
-            QAMenu.shared = QAMenu()
-            QAMenu.shared?.orderFront(nil)
-            if QAMenu.openSettingsOnLaunch { App.showSettingsWindow() }
+        QAMenu.shared = QAMenu()
+        QAMenu.shared?.orderFront(nil)
+        if QAMenu.openSettingsOnLaunch { App.showSettingsWindow() }
+        if QAMenu.graphEnabled { DebugMenu.setEnabled(true) }
         #endif
         UsageStats.prune()
         ProTransitionManager.shared.onAction = {

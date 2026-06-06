@@ -2,38 +2,70 @@ import Cocoa
 import Carbon.HIToolbox.Events
 import ShortcutRecorder
 
+/// Coordinator for the Controls section.
+///
+/// Owns the shortcut sidebar (list of shortcuts + the gesture row + count buttons), one recycled
+/// `ShortcutEditor` (re-bound across shortcuts 0..N-1 as the user picks rows), and a fixed-bind
+/// editor view for the gesture. Also keeps the global shortcut-registry logic (`shortcuts` dict,
+/// `addShortcut` / `removeShortcutIfExists` / `applyShortcutPreference`) and the arrow/vim helper
+/// callbacks consumed by other modules.
 class ControlsTab {
+    // MARK: - Public runtime state consumed by other modules
+
+    /// Runtime model of all globally-bound shortcuts, keyed by their identifier
+    /// (`holdShortcut0`, `nextWindowShortcut2`, etc.). Driven by `applyShortcutPreference`.
+    /// Read by KeyboardEvents, KeyRepeatTimer, ATShortcut, TilesView, CustomRecorderControl,
+    /// and the conflict detectors.
     static var shortcuts = [String: ATShortcut]()
+
+    /// UI lookup: for any recorder currently displayed in Settings, its (control, label string).
+    /// Populated by `TriggerBinding.bind` and by `LabelAndControl.makeLabelWithRecorder` (used in
+    /// the always-displayed sheets). With the recycled editor we only keep entries for the
+    /// currently-bound shortcut; operations on other shortcuts go through `Preferences` directly.
     static var shortcutControls = [String: (CustomRecorderControl, String)]()
+
     static var arrowKeysCheckbox: Switch!
     static var vimKeysCheckbox: Switch!
 
     static var shortcutsWhenActiveSheet: ShortcutsWhenActiveSheet!
     static var additionalControlsSheet: AdditionalControlsSheet!
 
-    private static let shortcutSidebarWidth = CGFloat(175)
+    /// Map from a tab-segment `NSSegmentedControl` (Filtering / Appearance / Ordering) to the
+    /// per-segment list of searchable strings. Consulted by
+    /// `SettingsWindow.highlightTarget(_ segmentedControl:)` to bubble a search match into the
+    /// parent segment so a query that targets a (possibly unbuilt — see lazy panes) pane lights
+    /// up the corresponding tab segment yellow. Two entries today: one for the shortcut editor's
+    /// tab control, one for the gesture editor's tab control.
+    static var tabSegmentSearchableStrings = [ObjectIdentifier: [[String]]]()
+
+    // MARK: - Layout constants (unchanged from the old monolithic editor)
+
+    private static let shortcutSidebarWidth = CGFloat(180)
     private static let sidebarRowHeight = CGFloat(52)
     private static let sidebarHorizontalPadding = TableGroupView.padding
     private static let shortcutEditorTopBottomPadding = TableGroupView.padding
     private static let shortcutEditorRightPadding = TableGroupView.padding
     private static var shortcutEditorWidth: CGFloat { SettingsWindow.contentWidth - shortcutSidebarWidth - 1 }
-    private static var shortcutEditorContentWidth: CGFloat { shortcutEditorWidth - shortcutEditorRightPadding }
-    /// Minimum height for a shortcut editor's content block. Anchored to roughly the height of the
-    /// Filtering pane (the tallest of the three tabs) so switching to a short tab like Ordering
-    /// doesn't make the surrounding rounded section visibly snap up — the bottom just gets
-    /// whitespace instead.
-    private static let controlTabMinHeight = CGFloat(400)
-    /// Fixed height for the Trigger row's content (recorder + labels). We pin this rather than
-    /// derive it from a dummy recorder's intrinsic size, because `RecorderControl`'s intrinsic
-    /// height isn't guaranteed to be set at the moment `TableGroupView.setMainRow` snapshots
-    /// `mainRow.fittingSize.height` — depending on when in the layout cycle the row is built,
-    /// the snapshot can land before the style's constraints have populated, yielding inconsistent
-    /// row heights across shortcuts.
-    private static let triggerRowContentHeight = CGFloat(22)
+    static var shortcutEditorContentWidth: CGFloat { shortcutEditorWidth - shortcutEditorRightPadding }
     private static let gestureSelectionIndex = -1
     private static let staticManagedShortcutPreferences = [
         "focusWindowShortcut", "previousWindowShortcut", "cancelShortcut", "searchShortcut", "lockSearchShortcut",
         "closeWindowShortcut", "minDeminWindowShortcut", "toggleFullscreenWindowShortcut", "quitAppShortcut", "hideShowAppShortcut",
+    ]
+    /// Canonical id → localized label for the always-active ("when active") shortcuts. Single source
+    /// of truth: `ShortcutsWhenActiveSheet` reads its row titles from here, and `conflictLabel(_:)`
+    /// uses it to name a conflicting shortcut without needing its (possibly-unbuilt) sheet control.
+    static let staticShortcutLabels = [
+        "focusWindowShortcut": NSLocalizedString("Focus selected window", comment: ""),
+        "previousWindowShortcut": NSLocalizedString("Select previous window", comment: ""),
+        "cancelShortcut": NSLocalizedString("Cancel", comment: ""),
+        "searchShortcut": NSLocalizedString("Search", comment: ""),
+        "lockSearchShortcut": NSLocalizedString("Lock search", comment: ""),
+        "closeWindowShortcut": NSLocalizedString("Close window", comment: ""),
+        "minDeminWindowShortcut": NSLocalizedString("Minimize/Deminimize window", comment: ""),
+        "toggleFullscreenWindowShortcut": NSLocalizedString("Fullscreen/Defullscreen window", comment: ""),
+        "quitAppShortcut": NSLocalizedString("Quit app", comment: ""),
+        "hideShowAppShortcut": NSLocalizedString("Hide/Show app", comment: ""),
     ]
     private static let removableShortcutPreferences = [
         "holdShortcut", "nextWindowShortcut",
@@ -44,13 +76,8 @@ class ControlsTab {
         "appearanceStyleOverride", "appearanceSizeOverride", "appearanceThemeOverride",
         "shortcutStyleOverride", "previewFocusedWindowOverride",
     ]
-    private static let shortcutDropdownPreferences = [
-        "appsToShow", "spacesToShow", "screensToShow",
-        "showMinimizedWindows", "showHiddenWindows", "showFullscreenWindows", "showWindowlessApps",
-        "windowOrder",
-        "showAppsOrWindows",
-    ]
     private static let arrowKeys = ["←", "→", "↑", "↓"]
+    private static let arrowKeyCodes: Set<KeyCode> = [.leftArrow, .rightArrow, .upArrow, .downArrow]
     private static let vimKeyActions = [
         "h": "vimCycleLeft",
         "l": "vimCycleRight",
@@ -58,112 +85,64 @@ class ControlsTab {
         "j": "vimCycleDown",
     ]
 
+    // MARK: - Editor + sidebar state
+
+    private static var editor: ShortcutEditor!
+    private static var gestureEditorView: NSView?
+    private static var gestureEditorTabControl: NSSegmentedControl?
+    /// Outer container of the gesture editor — used by `ensureGesturePaneBuilt` to append a pane
+    /// to it the first time the user selects that segment. Kept weak via the static-let pattern
+    /// (cleared in `cleanup()`).
+    private static var gestureEditorContainer: NSStackView?
+    private static var gestureFilteringPane: FilteringPane?
+    private static var gestureAppearancePane: AppearancePane?
+    private static var gestureOrderingPane: OrderingPane?
     private static var selectedShortcutIndex = 0
-    private static var selectedTabSegment = 0
     private static var shortcutRowsStackView: NSStackView?
     private static var shortcutRows = [SidebarListRow]()
-    private static var shortcutEditorViews = [NSView]()
     private static var gestureSidebarRow: SidebarListRow?
-    private static var gestureEditorView: NSView?
     private static var shortcutCountButtons: NSSegmentedControl?
     private static var shortcutRowsScrollView: NSScrollView?
     private static var shortcutRowsScrollObserver: NSObjectProtocol?
-    /// Per-shortcut tab control + its content panes (one per segment, in segment order). Keyed by
-    /// shortcut index (0..maxShortcutCount, with `gestureIndex` for the gesture). Updated in
-    /// `controlTab(_:_:_:)`, read by `switchControlTabSection` and `selectShortcutAndShowAppearance`.
-    /// Panes order matches the segments: Filtering, Appearance, Ordering and Grouping.
-    private static var tabContentsByIndex = [Int: (panes: [NSView], tabControl: NSSegmentedControl)]()
-    /// Maps each Filtering/Appearance `tabControl` to the two content views (one per segment).
-    /// Consulted by `SettingsWindow.highlightTarget(_ segmentedControl:)` so a search match deep
-    /// inside the Filtering or Appearance subtree turns the corresponding tab segment yellow —
-    /// same affordance as sheet buttons, which highlight when their sheet's contents match.
-    static var tabSegmentSubtrees = [ObjectIdentifier: [NSView]]()
-    /// Override control views keyed by the indexed UserDefaults key (e.g. `appearanceStyleOverride2`).
-    /// Used by `syncOverrideControlToGlobal` to re-display the global value on non-overridden controls
-    /// after the user changes the global setting.
-    private static var overrideControls = [String: NSView]()
-    /// Unlink buttons keyed by the indexed UserDefaults key. Visible iff `hasOverride` is true.
-    private static var unlinkButtons = [String: NSButton]()
-    /// Pro-badge views for the Pro-gated override segments. Keyed by the indexed UserDefaults key.
-    /// Stored so `extraAction` callbacks and the Pro-lock observer can call
-    /// `AppearanceTab.refreshTrailingSegmentBadge(...)` per shortcut.
-    private static var overrideProBadges = [String: ProBadgeView.SegmentOverlay]()
+    private static var proLockObserver: NSObjectProtocol?
+
+    // MARK: - Initialization / teardown
 
     static func initializePreferencesDependentState() {
         applyActiveShortcutPreferences()
         staticManagedShortcutPreferences.forEach { applyShortcutPreference($0) }
-        applyArrowKeysPreference()
+        applyArrowKeysPreferenceWithoutDialogs()
         applyVimKeysPreferenceWithoutDialogs()
     }
 
-    static func preferenceChanged(_ key: String) {
-        switch key {
-        case "shortcutCount":
-            applyActiveShortcutPreferences()
-            (0..<Preferences.shortcutCount).forEach { initializeShortcutRecorderState($0) }
-            refreshShortcutUi()
-        case "nextWindowGesture":
-            refreshGestureRow()
-        case let k where isShortcutPreferenceKey(k):
-            if Preferences.nameToIndex(k) < Preferences.shortcutCount {
-                syncShortcutRecorderControlValue(k)
-                applyShortcutPreference(k)
-            } else {
-                removeShortcutIfExists(k)
-            }
-            refreshShortcutRows()
-        case let k where staticManagedShortcutPreferences.contains(k):
-            applyShortcutPreference(k)
-        case let k where Preferences.overrideToGlobalKey.values.contains(k):
-            // A global appearance setting changed; resnap non-overridden controls and refresh
-            // the AppearanceTab "Overridden in Shortcut:" labels.
-            syncOverrideControlsToGlobal()
-            AppearanceTab.refreshAllOverrideInfoLabels()
-        case let k where isOverrideKey(k):
-            // An override key changed (e.g. user picked a different value, or remembered-restore wrote).
-            refreshUnlinkButtons()
-            AppearanceTab.refreshAllOverrideInfoLabels()
-        case "arrowKeysEnabled":
-            applyArrowKeysPreference()
-        case "vimKeysEnabled" where vimKeysCheckbox == nil:
-            applyVimKeysPreferenceWithoutDialogs()
-        default:
-            break
-        }
-    }
-
-    static func inputSourceChanged() {
-        refreshShortcutRows()
-        refreshShortcutControlsDisplay()
-    }
-
-    private static var proLockObserver: NSObjectProtocol?
-
     static func initTab() -> NSView {
-        shortcutEditorViews = (0..<Preferences.maxShortcutCount).map { shortcutTab($0) }
-        gestureEditorView = gestureTab(Preferences.gestureIndex)
+        editor = ShortcutEditor(width: shortcutEditorContentWidth)
+        let shortcutEntry = editor.tabSegmentSearchableStringsEntry
+        tabSegmentSearchableStrings[shortcutEntry.key] = shortcutEntry.perSegmentStrings
+
+        gestureEditorView = makeGestureEditor()
+
         let shortcutsView = makeShortcutsView()
         let additionalControlsButton = NSButton(title: NSLocalizedString("Additional controls…", comment: ""), target: self, action: #selector(showAdditionalControlsSettings))
         let shortcutsButton = NSButton(title: NSLocalizedString("Shortcuts when active…", comment: ""), target: self, action: #selector(showShortcutsSettings))
         let tools = StackView([additionalControlsButton, shortcutsButton], .horizontal)
-        // `padding: 0` — section's left margin is already applied by `SettingsWindow.addSection`.
-        // See the same comment in `AppearanceTab.makeView` for the alignment rationale.
         let view = TableGroupSetView(originalViews: [shortcutsView], toolsViews: [tools], padding: 0, bottomPadding: 0, othersAlignment: .leading, toolsAlignment: .trailing)
-        shortcutsWhenActiveSheet = ShortcutsWhenActiveSheet()
-        additionalControlsSheet = AdditionalControlsSheet()
+
+        // Sheets are built lazily on first show. Pre-build search visibility is provided by
+        // their static `searchableStrings`, consulted through `SettingsSearchIndex`.
+
         refreshShortcutUi()
+        let initialBindIndex = (selectedShortcutIndex == gestureSelectionIndex) ? 0 : selectedShortcutIndex
+        editor.bind(toShortcut: initialBindIndex)
         (0..<Preferences.shortcutCount).forEach { initializeShortcutRecorderState($0) }
+
         if proLockObserver == nil {
             proLockObserver = NotificationCenter.default.addObserver(
                 forName: ProTransitionManager.proLockStateDidChangeNotification,
                 object: nil, queue: .main
             ) { _ in
                 refreshShortcutUi()
-                // The 3 Pro-gated index-0 overrides may have been snapshot+downgraded by
-                // `ProTransitionState.onProLockEngaged`; the bound segmented/radio controls hold
-                // the now-stale pre-downgrade value. Resync them to the current stored value so
-                // the UI reflects the locked state without requiring a Settings reopen.
-                refreshGatedOverrideControlsFromStored()
+                editor?.refreshFromCurrentBind()
             }
         }
         return view
@@ -178,27 +157,107 @@ class ControlsTab {
             NotificationCenter.default.removeObserver(observer)
             shortcutRowsScrollObserver = nil
         }
-        // No .close() on sheets — see AppearanceTab.cleanup() comment.
         shortcutsWhenActiveSheet = nil
         additionalControlsSheet = nil
         arrowKeysCheckbox = nil
         vimKeysCheckbox = nil
-        // shortcutControls holds CustomRecorderControl views; clear so ARC reclaims them.
-        // (`shortcuts` is the runtime model dict and is populated independently of SettingsWindow at launch.)
         shortcutControls.removeAll()
         shortcutRows.removeAll()
-        shortcutEditorViews.removeAll()
-        tabContentsByIndex.removeAll()
-        overrideControls.removeAll()
-        unlinkButtons.removeAll()
-        overrideProBadges.removeAll()
-        tabSegmentSubtrees.removeAll()
+        tabSegmentSearchableStrings.removeAll()
+        editor = nil
+        gestureEditorView = nil
+        gestureEditorTabControl = nil
+        gestureEditorContainer = nil
+        gestureFilteringPane = nil
+        gestureAppearancePane = nil
+        gestureOrderingPane = nil
         shortcutRowsStackView = nil
         gestureSidebarRow = nil
-        gestureEditorView = nil
         shortcutCountButtons = nil
         shortcutRowsScrollView = nil
     }
+
+    // MARK: - Preference-change routing
+
+    static func preferenceChanged(_ key: String) {
+        switch key {
+        case "shortcutCount":
+            applyActiveShortcutPreferences()
+            (0..<Preferences.shortcutCount).forEach { initializeShortcutRecorderState($0) }
+            refreshShortcutUi()
+        case "nextWindowGesture":
+            refreshGestureRow()
+        case let k where isShortcutPreferenceKey(k):
+            let i = Preferences.nameToIndex(k)
+            if i < Preferences.shortcutCount {
+                // If the changed key targets the currently-bound editor, refresh it so the
+                // recorder displays the new value. Otherwise the value lives in Preferences and
+                // doesn't need any UI work.
+                if i == selectedShortcutIndex { editor?.refreshFromCurrentBind() }
+                applyShortcutPreference(k)
+            } else {
+                removeShortcutIfExists(k)
+            }
+            refreshShortcutRows()
+        case let k where staticManagedShortcutPreferences.contains(k):
+            applyShortcutPreference(k)
+        case let k where Preferences.overrideToGlobalKey.values.contains(k):
+            // A global appearance setting changed; resnap non-overridden controls in the editor
+            // and refresh AppearanceTab's "Overridden in Shortcut:" labels.
+            editor?.refreshFromCurrentBind()
+            AppearanceTab.refreshAllOverrideInfoLabels()
+        case let k where isOverrideKey(k):
+            // An override key changed (e.g. user picked a different value, or remembered-restore wrote).
+            editor?.refreshFromCurrentBind()
+            AppearanceTab.refreshAllOverrideInfoLabels()
+        case "arrowKeysEnabled" where arrowKeysCheckbox == nil:
+            applyArrowKeysPreferenceWithoutDialogs()
+        case "vimKeysEnabled" where vimKeysCheckbox == nil:
+            applyVimKeysPreferenceWithoutDialogs()
+        default:
+            break
+        }
+    }
+
+    static func inputSourceChanged() {
+        refreshShortcutRows()
+        refreshShortcutControlsDisplay()
+    }
+
+    /// Called by AppearanceTab when a global appearance pref changes.
+    /// In the new design this is equivalent to a no-arg refresh of the current editor binding.
+    static func syncOverrideControlsToGlobal() {
+        editor?.refreshFromCurrentBind()
+    }
+
+    /// Deep-link from AppearanceTab's "Overridden in Shortcut: N" button — select the shortcut and
+    /// switch the editor to the Appearance segment.
+    static func selectShortcutAndShowAppearance(_ index: Int) {
+        selectShortcut(index)
+        editor?.showAppearanceSegment()
+    }
+
+    // MARK: - Editor swap based on sidebar selection
+
+    private static func showEditor(forShortcut: Bool) {
+        editor?.view.isHidden = !forShortcut
+        gestureEditorView?.isHidden = forShortcut
+        if !forShortcut {
+            // The gesture editor's tabControl + pane visibility may have drifted out of sync
+            // while it was hidden (user switched tabs on the shortcut editor in the meantime).
+            // Resync from the shared `ShortcutEditor.selectedTabSegment` before showing it.
+            syncGestureEditorTabSegment()
+        }
+    }
+
+    private static func syncGestureEditorTabSegment() {
+        guard let tabControl = gestureEditorTabControl else { return }
+        let segment = ShortcutEditor.selectedTabSegment
+        tabControl.selectedSegment = segment
+        ensureGesturePaneBuilt(forSegment: segment)
+    }
+
+    // MARK: - Sidebar + container view
 
     private static func makeShortcutsView() -> NSView {
         return makeSidebarEditorContainer(sidebar: makeShortcutSidebar(), editor: makeEditorPane())
@@ -208,10 +267,8 @@ class ControlsTab {
         let pane = NSView()
         pane.translatesAutoresizingMaskIntoConstraints = false
         pane.widthAnchor.constraint(equalToConstant: shortcutEditorWidth).isActive = true
-        var views = shortcutEditorViews
-        if let gestureEditorView {
-            views.append(gestureEditorView)
-        }
+        var views: [NSView] = [editor.view]
+        if let gestureEditorView { views.append(gestureEditorView) }
         let editorsStack = NSStackView(views: views)
         editorsStack.orientation = .vertical
         editorsStack.alignment = .leading
@@ -240,6 +297,9 @@ class ControlsTab {
         rows.spacing = 0
         rows.translatesAutoresizingMaskIntoConstraints = false
         shortcutRowsStackView = rows
+        // Start the recycled row pool empty and bound to this freshly-built stack view;
+        // `refreshShortcutRows` grows it on demand. (`cleanup` also clears it on window close.)
+        shortcutRows.removeAll()
         let rowsScrollView = ForwardingVerticalScrollView()
         rowsScrollView.translatesAutoresizingMaskIntoConstraints = false
         rowsScrollView.drawsBackground = false
@@ -265,8 +325,6 @@ class ControlsTab {
         shortcutsSection.addSubview(rowsScrollView)
         shortcutsSection.addSubview(gestureSeparator)
         shortcutsSection.addSubview(gestureRow)
-        // Use SF Symbols glyphs instead of literal "+"/"-" strings — NSSegmentedControl draws
-        // those ASCII glyphs noticeably below the vertical center. Symbols center properly.
         let plus = NSImage.fromSymbol(.plus, pointSize: 11)
         let minus = NSImage.fromSymbol(.minus, pointSize: 11)
         let countButtons = NSSegmentedControl(images: [plus, minus], trackingMode: .momentary, target: self, action: #selector(updateShortcutCount(_:)))
@@ -316,530 +374,113 @@ class ControlsTab {
         return sidebar
     }
 
-    private static func shortcutTab(_ index: Int) -> NSView {
-        let holdName = Preferences.indexToName("holdShortcut", index)
-        var holdShortcut = LabelAndControl.makeLabelWithRecorder(NSLocalizedString("Hold", comment: ""), holdName, Preferences.shortcut(holdName), false, labelPosition: .leftWithoutSeparator)
-        holdShortcut.append(LabelAndControl.makeLabel(NSLocalizedString("and press", comment: "")))
-        let nextName = Preferences.indexToName("nextWindowShortcut", index)
-        let nextWindowShortcut = LabelAndControl.makeLabelWithRecorder(NSLocalizedString("Select next window", comment: ""), nextName, Preferences.shortcut(nextName), labelPosition: .right)
-        // Pin the trigger row's content to a fixed height so every shortcut's Trigger row is
-        // identical, regardless of `RecorderControl`'s intrinsic-size readiness at layout time.
-        let triggerContent = NSStackView(views: holdShortcut + [nextWindowShortcut[0]])
+    // MARK: - Gesture editor
+
+    /// Fixed-bind editor for the gesture. Same shape as the shortcut editor (Filtering /
+    /// Appearance / Ordering panes), but with a single dropdown for the gesture trigger and bound
+    /// permanently to `Preferences.gestureIndex`. Built once, never rebinds.
+    private static func makeGestureEditor() -> NSView {
+        let message = NSLocalizedString("You may need to disable some conflicting system gestures", comment: "")
+        let openTrackpad = NSButton(title: NSLocalizedString("Open Trackpad Settings…", comment: ""), target: self, action: #selector(openSystemGestures(_:)))
+        let infoBtn = LabelAndControl.makeInfoButton(searchableTooltipTexts: [message], onMouseEntered: { event, view in
+            Popover.shared.show(event: event, positioningView: view, message: message, extraView: openTrackpad)
+        })
+        let gestureDropdown = LabelAndControl.makeDropdown("nextWindowGesture", GesturePreference.allCases)
+        let triggerContent = NSStackView()
         triggerContent.orientation = .horizontal
         triggerContent.alignment = .centerY
-        triggerContent.spacing = TableGroupView.spacing
-        triggerContent.heightAnchor.constraint(equalToConstant: triggerRowContentHeight).isActive = true
-        return controlTab(index, [triggerContent], shortcutEditorContentWidth)
-    }
+        triggerContent.setViews([gestureDropdown], in: .trailing)
+        triggerContent.setViews([infoBtn], in: .leading)
+        triggerContent.heightAnchor.constraint(equalToConstant: ShortcutEditor.triggerRowContentHeight).isActive = true
 
-    private static func gestureTab(_ index: Int) -> NSView {
-        let message = NSLocalizedString("You may need to disable some conflicting system gestures", comment: "")
-        let button = NSButton(title: NSLocalizedString("Open Trackpad Settings…", comment: ""), target: self, action: #selector(openSystemGestures(_:)))
-        let infoBtn = LabelAndControl.makeInfoButton(searchableTooltipTexts: [message], onMouseEntered: { event, view in
-            Popover.shared.show(event: event, positioningView: view, message: message, extraView: button)
-        })
-        let gesture = LabelAndControl.makeDropdown("nextWindowGesture", GesturePreference.allCases)
-        let gestureWithTooltip = NSStackView()
-        gestureWithTooltip.orientation = .horizontal
-        gestureWithTooltip.alignment = .centerY
-        gestureWithTooltip.setViews([gesture], in: .trailing)
-        gestureWithTooltip.setViews([infoBtn], in: .leading)
-        // Pin to the same fixed height the shortcut tab uses, so the Trigger row is consistent
-        // across all entries in the sidebar (shortcuts AND the Gesture row).
-        gestureWithTooltip.heightAnchor.constraint(equalToConstant: triggerRowContentHeight).isActive = true
-        return controlTab(index, [gestureWithTooltip], shortcutEditorContentWidth)
-    }
-
-    private static func controlTab(_ index: Int, _ trigger: [NSView], _ width: CGFloat) -> NSView {
+        let width = shortcutEditorContentWidth
         let triggerTable = TableGroupView(width: width)
-        triggerTable.addRow(TableGroupView.Row(leftTitle: NSLocalizedString("Trigger", comment: ""), rightViews: trigger))
-        let panes: [NSView] = [
-            makeFilteringTable(index, width),
-            makeAppearanceTable(index, width),
-            makeOrderingGroupingTable(index, width),
-        ]
+        triggerTable.addRow(TableGroupView.Row(leftTitle: ShortcutEditor.triggerLabel, rightViews: [triggerContent]))
+
+        // Section-level search registration: every pane's static strings go into the active
+        // SettingsSearchIndex even though we haven't built the panes yet. This keeps the
+        // Exceptions section searchable for pane content before the user has ever opened the
+        // gesture editor.
+        SettingsSearchIndex.registerStrings(FilteringPane.searchableStrings)
+        SettingsSearchIndex.registerStrings(AppearancePane.searchableStrings)
+        SettingsSearchIndex.registerStrings(OrderingPane.searchableStrings)
+
         let labels = [
-            NSLocalizedString("Filtering", comment: ""),
-            NSLocalizedString("Appearance", comment: ""),
-            NSLocalizedString("Ordering & Grouping", comment: ""),
+            ShortcutEditor.tabLabelFiltering,
+            ShortcutEditor.tabLabelAppearance,
+            ShortcutEditor.tabLabelOrdering,
         ]
-        let tabControl = NSSegmentedControl(labels: labels, trackingMode: .selectOne, target: self, action: #selector(switchControlTabSection(_:)))
-        tabControl.tag = index
-        tabControl.selectedSegment = selectedTabSegment
+        let tabControl = NSSegmentedControl(labels: labels, trackingMode: .selectOne, target: nil, action: nil)
+        tabControl.selectedSegment = ShortcutEditor.selectedTabSegment
         LabelAndControl.applySystemSelectedSegmentStyle(tabControl)
         tabControl.widthAnchor.constraint(equalToConstant: width).isActive = true
-        // Pin each segment to an equal share of the control width. Without this the auto-sizing
-        // gives each segment its intrinsic-content width, which `segmentedControlSegmentRects`
-        // can't see — its even-split fallback would then misalign the yellow search highlight
-        // from the actual segment boundary.
         let segmentWidth = width / CGFloat(labels.count)
-        for i in 0..<labels.count {
-            tabControl.setWidth(segmentWidth, forSegment: i)
+        for i in 0..<labels.count { tabControl.setWidth(segmentWidth, forSegment: i) }
+        tabControl.onAction = { [weak tabControl] _ in
+            guard let tabControl else { return }
+            let seg = tabControl.selectedSegment
+            ShortcutEditor.selectedTabSegment = seg
+            ensureGesturePaneBuilt(forSegment: seg)
+            // Keep the shortcut editor's tab in sync — the user expects sidebar navigation
+            // between shortcuts/gesture to preserve their tab choice.
+            editor?.applySelectedSegment(seg)
         }
-        for (i, pane) in panes.enumerated() {
-            pane.isHidden = selectedTabSegment != i
-        }
-        tabContentsByIndex[index] = (panes: panes, tabControl: tabControl)
-        tabSegmentSubtrees[ObjectIdentifier(tabControl)] = panes
-        let container = NSStackView(views: [triggerTable, tabControl] + panes)
+        tabSegmentSearchableStrings[ObjectIdentifier(tabControl)] = [
+            FilteringPane.searchableStrings,
+            AppearancePane.searchableStrings,
+            OrderingPane.searchableStrings,
+        ]
+        gestureEditorTabControl = tabControl
+
+        // No `contentMinHeight` constraint here — the gesture editor sizes itself naturally —
+        // so we can use plain `addArrangedSubview` without the gravity-area workarounds that
+        // `ShortcutEditor` needs for its min-height constraint.
+        let container = NSStackView()
         container.orientation = .vertical
         container.alignment = .leading
         container.spacing = TableGroupSetView.tableGroupSpacing
-        // Extra breathing room below the Trigger row — it's the headline action of the editor
-        // and the tab control / content tables that follow are secondary configuration.
+        container.addArrangedSubview(triggerTable)
+        container.addArrangedSubview(tabControl)
         container.setCustomSpacing(10, after: triggerTable)
-        // Pin a minimum height so switching to a short tab (e.g. Ordering, 3 rows) doesn't snap
-        // the surrounding shortcut section's rounded background up. The tallest tab (Filtering)
-        // hits about this height; everything else gets bottom whitespace.
-        container.heightAnchor.constraint(greaterThanOrEqualToConstant: controlTabMinHeight).isActive = true
+        gestureEditorContainer = container
+
+        // Build the initially-selected pane so the editor isn't empty when first shown.
+        ensureGesturePaneBuilt(forSegment: ShortcutEditor.selectedTabSegment)
         return container
     }
 
-    private static func makeFilteringTable(_ index: Int, _ width: CGFloat) -> NSView {
-        let appsToShow = LabelAndControl.makeDropdown(Preferences.indexToName("appsToShow", index), AppsToShowPreference.allCases)
-        let spacesToShow = LabelAndControl.makeDropdown(Preferences.indexToName("spacesToShow", index), SpacesToShowPreference.allCases)
-        let screensToShow = LabelAndControl.makeDropdown(Preferences.indexToName("screensToShow", index), ScreensToShowPreference.allCases)
-        let showMinimizedWindows = LabelAndControl.makeDropdown(Preferences.indexToName("showMinimizedWindows", index), ShowHowPreference.allCases)
-        let showHiddenWindows = LabelAndControl.makeDropdown(Preferences.indexToName("showHiddenWindows", index), ShowHowPreference.allCases)
-        let showFullscreenWindows = LabelAndControl.makeDropdown(Preferences.indexToName("showFullscreenWindows", index), ShowHowPreference.allCases.filter { $0 != .showAtTheEnd })
-        let showWindowlessApps = LabelAndControl.makeDropdown(Preferences.indexToName("showWindowlessApps", index), ShowHowPreference.allCases)
-        let filteringTable = TableGroupView(width: width)
-        filteringTable.addRow(leftViews: [TableGroupView.makeText(NSLocalizedString("Show windows from applications", comment: ""))], rightViews: [appsToShow])
-        filteringTable.addRow(leftViews: [TableGroupView.makeText(NSLocalizedString("Show windows from Spaces", comment: ""))], rightViews: [spacesToShow])
-        filteringTable.addRow(leftViews: [TableGroupView.makeText(NSLocalizedString("Show windows from screens", comment: ""))], rightViews: [screensToShow])
-        filteringTable.addRow(TableGroupView.Row(leftTitle: NSLocalizedString("Show minimized windows", comment: ""), rightViews: [showMinimizedWindows]))
-        filteringTable.addRow(TableGroupView.Row(leftTitle: NSLocalizedString("Show hidden windows", comment: ""), rightViews: [showHiddenWindows]))
-        filteringTable.addRow(TableGroupView.Row(leftTitle: NSLocalizedString("Show fullscreen windows", comment: ""), rightViews: [showFullscreenWindows]))
-        filteringTable.addRow(TableGroupView.Row(leftTitle: NSLocalizedString("Show apps with no open window", comment: ""), rightViews: [showWindowlessApps]))
-        return filteringTable
-    }
-
-    /// "Ordering and Grouping" tab content: per-shortcut window-order and grouping preferences.
-    private static func makeOrderingGroupingTable(_ index: Int, _ width: CGFloat) -> TableGroupView {
-        let table = TableGroupView(width: width)
-        table.addRow(TableGroupView.Row(leftTitle: NSLocalizedString("Group apps", comment: ""),
-            rightViews: [LabelAndControl.makeDropdown(Preferences.indexToName("showAppsOrWindows", index), ShowAppsOrWindowsPreference.allCases)]))
-        table.addRow(TableGroupView.Row(leftTitle: NSLocalizedString("Group tabs", comment: ""),
-            rightViews: [LabelAndControl.makeDropdown(Preferences.indexToName("showTabsAsWindows", index), GroupTabsPreference.allCases)]))
-        table.addRow(TableGroupView.Row(leftTitle: NSLocalizedString("Order windows by", comment: ""),
-            rightViews: [LabelAndControl.makeDropdown(Preferences.indexToName("windowOrder", index), WindowOrderPreference.allCases)]))
-        return table
-    }
-
-    private static func makeAppearanceTable(_ index: Int, _ width: CGFloat) -> NSView {
-        let table = TableGroupView(width: width)
-        let sizeProIndex = AppearanceSizePreference.allCases.firstIndex(of: .auto)!
-        let shortcutStyleProIndex = ShortcutStylePreference.allCases.firstIndex(of: .searchOnRelease)!
-        let extraAction: () -> Void = {
-            refreshUnlinkButtons()
-            AppearanceTab.refreshAllOverrideInfoLabels()
-        }
-        // Style (radio buttons; non-thumbnails entries are Pro-gated)
-        let styleKey = Preferences.indexToName("appearanceStyleOverride", index)
-        let styleRadios = LabelAndControl.makeImageRadioButtons(
-            styleKey, AppearanceStylePreference.allCases,
-            extraAction: nil, buttonSpacing: 10,
-            proGatedIndices: AppearanceTab.proGatedAppearanceStyleIndices())
-        AppearanceTab.addProBadgesToStyleButtons(styleRadios)
-        overrideControls[styleKey] = styleRadios
-        if !Preferences.hasOverride("appearanceStyleOverride", index) {
-            syncRadioButtons(styleRadios, to: Preferences.appearanceStyle.index)
-        }
-        installOverrideRadioButtonActions(styleRadios,
-            baseName: "appearanceStyleOverride",
-            index: index,
-            valueAtIndex: { AppearanceStylePreference.allCases[$0].indexAsString },
-            globalIndex: { Preferences.appearanceStyle.index },
-            proGatedIndices: AppearanceTab.proGatedAppearanceStyleIndices(),
-            onChange: extraAction)
-        let styleUnlink = makeUnlinkButton("appearanceStyleOverride", index)
-        let styleRow = NSStackView(views: [styleRadios, styleUnlink])
-        styleRow.orientation = .horizontal
-        styleRow.alignment = .centerY
-        styleRow.spacing = TableGroupView.padding
-        table.addRow(secondaryViews: [styleRow], secondaryViewsAlignment: .centerX)
-        // Size (segmented control; `.auto` is Pro-gated)
-        let sizeKey = Preferences.indexToName("appearanceSizeOverride", index)
-        let sizeControl = LabelAndControl.makeSegmentedControl(sizeKey, AppearanceSizePreference.allCases, segmentWidth: 100, extraAction: nil)
-        let sizeOverlay = AppearanceTab.addProBadgeToAutoSegment(sizeControl)
-        overrideProBadges[sizeKey] = sizeOverlay
-        overrideControls[sizeKey] = sizeControl
-        if !Preferences.hasOverride("appearanceSizeOverride", index) {
-            sizeControl.selectedSegment = Preferences.appearanceSize.index
-            AppearanceTab.refreshTrailingSegmentBadge(sizeControl, proIndex: sizeProIndex, overlay: sizeOverlay)
-        }
-        installOverrideSegmentedAction(sizeControl,
-            baseName: "appearanceSizeOverride",
-            index: index,
-            valueAtIndex: { AppearanceSizePreference.allCases[$0].indexAsString },
-            globalIndex: { Preferences.appearanceSize.index },
-            onChange: { [weak sizeControl] in
-                extraAction()
-                if let sc = sizeControl, let overlay = overrideProBadges[sizeKey] {
-                    AppearanceTab.refreshTrailingSegmentBadge(sc, proIndex: sizeProIndex, overlay: overlay)
-                }
-            })
-        wrapAppearanceSegmentProLockIntercept(sizeControl, key: sizeKey,
-            proIndex: sizeProIndex,
-            currentStoredIndex: { CachedUserDefaults.intFromMacroPref(sizeKey, AppearanceSizePreference.allCases) })
-        sizeOverlay.badge.onWindowKeyChanged = { [weak sizeControl] in
-            guard let sizeControl else { return }
-            AppearanceTab.refreshTrailingSegmentBadge(sizeControl, proIndex: sizeProIndex, overlay: sizeOverlay)
-        }
-        let sizeUnlink = makeUnlinkButton("appearanceSizeOverride", index)
-        table.addRow(leftText: NSLocalizedString("Size", comment: ""), rightViews: [sizeControl, sizeUnlink])
-        // Theme (segmented control; not Pro-gated)
-        let themeKey = Preferences.indexToName("appearanceThemeOverride", index)
-        let themeControl = LabelAndControl.makeSegmentedControl(themeKey, AppearanceThemePreference.allCases, segmentWidth: 100, extraAction: nil)
-        overrideControls[themeKey] = themeControl
-        if !Preferences.hasOverride("appearanceThemeOverride", index) {
-            themeControl.selectedSegment = Preferences.appearanceTheme.index
-        }
-        installOverrideSegmentedAction(themeControl,
-            baseName: "appearanceThemeOverride",
-            index: index,
-            valueAtIndex: { AppearanceThemePreference.allCases[$0].indexAsString },
-            globalIndex: { Preferences.appearanceTheme.index },
-            onChange: extraAction)
-        let themeUnlink = makeUnlinkButton("appearanceThemeOverride", index)
-        table.addRow(leftText: NSLocalizedString("Theme", comment: ""), rightViews: [themeControl, themeUnlink])
-        // After keys are released (segmented control; `.searchOnRelease` is Pro-gated)
-        let shortcutStyleKey = Preferences.indexToName("shortcutStyleOverride", index)
-        let shortcutStyleControl = LabelAndControl.makeSegmentedControl(shortcutStyleKey, ShortcutStylePreference.allCases, segmentWidth: 100, extraAction: nil)
-        let shortcutStyleOverlay = AppearanceTab.addProBadgeToShortcutStyleSegment(shortcutStyleControl, proIndex: shortcutStyleProIndex)
-        overrideProBadges[shortcutStyleKey] = shortcutStyleOverlay
-        overrideControls[shortcutStyleKey] = shortcutStyleControl
-        if !Preferences.hasOverride("shortcutStyleOverride", index) {
-            shortcutStyleControl.selectedSegment = Preferences.shortcutStyle.index
-            AppearanceTab.refreshTrailingSegmentBadge(shortcutStyleControl, proIndex: shortcutStyleProIndex, overlay: shortcutStyleOverlay)
-        }
-        installOverrideSegmentedAction(shortcutStyleControl,
-            baseName: "shortcutStyleOverride",
-            index: index,
-            valueAtIndex: { ShortcutStylePreference.allCases[$0].indexAsString },
-            globalIndex: { Preferences.shortcutStyle.index },
-            onChange: { [weak shortcutStyleControl] in
-                extraAction()
-                if let sc = shortcutStyleControl, let overlay = overrideProBadges[shortcutStyleKey] {
-                    AppearanceTab.refreshTrailingSegmentBadge(sc, proIndex: shortcutStyleProIndex, overlay: overlay)
-                }
-            })
-        wrapAppearanceSegmentProLockIntercept(shortcutStyleControl, key: shortcutStyleKey,
-            proIndex: shortcutStyleProIndex,
-            currentStoredIndex: { CachedUserDefaults.intFromMacroPref(shortcutStyleKey, ShortcutStylePreference.allCases) })
-        shortcutStyleOverlay.badge.onWindowKeyChanged = { [weak shortcutStyleControl] in
-            guard let shortcutStyleControl else { return }
-            AppearanceTab.refreshTrailingSegmentBadge(shortcutStyleControl, proIndex: shortcutStyleProIndex, overlay: shortcutStyleOverlay)
-        }
-        let shortcutStyleUnlink = makeUnlinkButton("shortcutStyleOverride", index)
-        table.addRow(leftText: NSLocalizedString("After keys are released", comment: ""), rightViews: [shortcutStyleControl, shortcutStyleUnlink])
-        // Preview selected window
-        let previewKey = Preferences.indexToName("previewFocusedWindowOverride", index)
-        let previewControl = LabelAndControl.makeSwitch(previewKey, extraAction: nil)
-        overrideControls[previewKey] = previewControl
-        if !Preferences.hasOverride("previewFocusedWindowOverride", index) {
-            previewControl.setSilently(Preferences.previewSelectedWindow ? .on : .off)
-        }
-        installOverrideSwitchAction(previewControl, baseName: "previewFocusedWindowOverride", index: index, onChange: extraAction)
-        let previewUnlink = makeUnlinkButton("previewFocusedWindowOverride", index)
-        table.addRow(leftText: NSLocalizedString("Preview selected window", comment: ""), rightViews: [previewControl, previewUnlink])
-        return table
-    }
-
-    /// Wrap a segmented control's `onAction` so clicking the Pro-gated segment while locked
-    /// redirects to the Upgrade tab instead of writing the preference. Mirrors
-    /// `AppearanceTab.wrapAppearanceSizeProLockIntercept` / `wrapShortcutStyleProLockIntercept`.
-    private static func wrapAppearanceSegmentProLockIntercept(_ segmentedControl: NSSegmentedControl, key: String, proIndex: Int, currentStoredIndex: @escaping () -> Int) {
-        let original = segmentedControl.onAction
-        segmentedControl.onAction = { control in
-            let segmented = control as! NSSegmentedControl
-            if segmented.selectedSegment == proIndex && LicenseManager.shared.isProLocked {
-                segmented.selectedSegment = currentStoredIndex()
-                // `original` (which wraps `extraAction`) is what refreshes the overlay — we bail
-                // before it fires, so resync the overlay manually now that we've reset the
-                // selection. Otherwise the badge keeps its pre-click "selected" state and the
-                // label/icon keep the selected text color.
-                if let overlay = overrideProBadges[key] {
-                    AppearanceTab.refreshTrailingSegmentBadge(segmented, proIndex: proIndex, overlay: overlay)
-                }
-                UpgradeTab.navigateToUpgradeTab()
-                return
+    private static func ensureGesturePaneBuilt(forSegment segment: Int) {
+        let width = shortcutEditorContentWidth
+        switch segment {
+        case 0:
+            if gestureFilteringPane == nil {
+                let pane = FilteringPane(width: width)
+                pane.bind(toShortcut: Preferences.gestureIndex)
+                gestureEditorContainer?.addArrangedSubview(pane.view)
+                gestureFilteringPane = pane
             }
-            original?(control)
-        }
-    }
-
-    @objc private static func switchControlTabSection(_ sender: NSSegmentedControl) {
-        selectedTabSegment = sender.selectedSegment
-        // Apply the same selection to every shortcut's editor so switching between shortcuts in the
-        // sidebar keeps the user's chosen tab. Without this, only the clicked editor would update.
-        for (_, contents) in tabContentsByIndex {
-            contents.tabControl.selectedSegment = selectedTabSegment
-            for (i, pane) in contents.panes.enumerated() {
-                pane.isHidden = selectedTabSegment != i
+        case 1:
+            if gestureAppearancePane == nil {
+                let pane = AppearancePane(width: width)
+                pane.bind(toShortcut: Preferences.gestureIndex)
+                gestureEditorContainer?.addArrangedSubview(pane.view)
+                gestureAppearancePane = pane
             }
-        }
-    }
-
-    private static func makeUnlinkButton(_ baseName: String, _ index: Int) -> NSButton {
-        let key = Preferences.indexToName(baseName, index)
-        let image = NSImage.fromSymbol(.link, pointSize: 14)
-        let button = NSButton(image: image, target: self, action: #selector(unlinkOverride(_:)))
-        button.identifier = NSUserInterfaceItemIdentifier("\(baseName)|\(index)")
-        button.bezelStyle = .regularSquare
-        button.isBordered = false
-        if #available(macOS 10.14, *) {
-            button.contentTintColor = .controlAccentColor
-        }
-        button.toolTip = NSLocalizedString("Sync with global value", comment: "")
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 20).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        button.isHidden = !Preferences.hasOverride(baseName, index)
-        unlinkButtons[key] = button
-        return button
-    }
-
-    @objc private static func unlinkOverride(_ sender: NSButton) {
-        guard let identifier = sender.identifier?.rawValue else { return }
-        let parts = identifier.split(separator: "|")
-        guard parts.count == 2, let index = Int(parts[1]) else { return }
-        let baseName = String(parts[0])
-        Preferences.removeOverride(baseName, index)
-        syncOverrideControlToGlobal(baseName, index)
-        refreshUnlinkButtons()
-        AppearanceTab.refreshAllOverrideInfoLabels()
-    }
-
-    /// Apply an `OverrideClickResolver.OverrideClickDecision` for a segmented/radio click.
-    /// Reads override state from `Preferences.hasOverride` + UserDefaults (before any write).
-    private static func applyOverrideClick(
-        baseName: String,
-        index: Int,
-        newIndex: Int,
-        valueAtIndex: (Int) -> String,
-        globalIndex: () -> Int
-    ) -> OverrideClickDecision {
-        let key = Preferences.indexToName(baseName, index)
-        let decision = OverrideClickResolver.decide(
-            newIndex: newIndex,
-            hasOverride: Preferences.hasOverride(baseName, index),
-            storedOverrideValue: UserDefaults.standard.string(forKey: key),
-            globalIndex: globalIndex(),
-            valueAtIndex: valueAtIndex)
-        if case .write(let value) = decision {
-            Preferences.set(key, value)
-        }
-        return decision
-    }
-
-    private static func installOverrideSegmentedAction(
-        _ control: NSSegmentedControl,
-        baseName: String,
-        index: Int,
-        valueAtIndex: @escaping (Int) -> String,
-        globalIndex: @escaping () -> Int,
-        onChange: @escaping () -> Void
-    ) {
-        control.onAction = { c in
-            let seg = c as! NSSegmentedControl
-            let decision = applyOverrideClick(
-                baseName: baseName, index: index,
-                newIndex: seg.selectedSegment,
-                valueAtIndex: valueAtIndex,
-                globalIndex: globalIndex)
-            if case .write = decision { onChange() }
-        }
-    }
-
-    private static func installOverrideRadioButtonActions(
-        _ stack: NSStackView,
-        baseName: String,
-        index: Int,
-        valueAtIndex: @escaping (Int) -> String,
-        globalIndex: @escaping () -> Int,
-        proGatedIndices: Set<Int>,
-        onChange: @escaping () -> Void
-    ) {
-        let key = Preferences.indexToName(baseName, index)
-        let buttonViews = stack.arrangedSubviews.compactMap { $0 as? ImageTextButtonView }
-        for (i, buttonView) in buttonViews.enumerated() {
-            buttonView.onClick = { [weak stack] _ in
-                guard let stack else { return }
-                let buttons = stack.arrangedSubviews.compactMap { $0 as? ImageTextButtonView }
-                if LicenseManager.shared.isProLocked && proGatedIndices.contains(i) {
-                    let storedIndex = Int(UserDefaults.standard.string(forKey: key) ?? "") ?? -1
-                    for (j, b) in buttons.enumerated() { b.state = (j == storedIndex) ? .on : .off }
-                    UpgradeTab.navigateToUpgradeTab()
-                    return
-                }
-                let decision = applyOverrideClick(
-                    baseName: baseName, index: index,
-                    newIndex: i,
-                    valueAtIndex: valueAtIndex,
-                    globalIndex: globalIndex)
-                // Always reconcile visual state (NSButton's radio click may have left siblings
-                // out of sync if we returned early in a previous click handler).
-                let onIndex: Int
-                switch decision {
-                case .skip:
-                    onIndex = Preferences.hasOverride(baseName, index)
-                        ? (Int(UserDefaults.standard.string(forKey: key) ?? "") ?? -1)
-                        : globalIndex()
-                case .write:
-                    onIndex = i
-                }
-                for (j, b) in buttons.enumerated() { b.state = (j == onIndex) ? .on : .off }
-                if case .write = decision { onChange() }
+        case 2:
+            if gestureOrderingPane == nil {
+                let pane = OrderingPane(width: width)
+                pane.bind(toShortcut: Preferences.gestureIndex)
+                gestureEditorContainer?.addArrangedSubview(pane.view)
+                gestureOrderingPane = pane
             }
-        }
-    }
-
-    private static func installOverrideSwitchAction(
-        _ control: Switch,
-        baseName: String,
-        index: Int,
-        onChange: @escaping () -> Void
-    ) {
-        let key = Preferences.indexToName(baseName, index)
-        control.onAction = { c in
-            let sw = c as! Switch
-            // Toggling always changes state, so there's no "same-value click" case to detect.
-            // Always write the override.
-            Preferences.set(key, sw.state == .on ? "true" : "false")
-            onChange()
-        }
-    }
-
-    /// Resnap an override control's displayed value to the current global, without firing a write
-    /// (so no override key is created). Used after `removeOverride` and after a global value changes.
-    /// For Pro-gated segments (Size / ShortcutStyle), also refreshes the badge overlay — without
-    /// this, the badge's icon/label colors stay frozen at their pre-resnap state, so an unlinked
-    /// "Search" segment keeps its selected white-on-blue look even after the selection moves to
-    /// "Focus".
-    private static func syncOverrideControlToGlobal(_ baseName: String, _ index: Int) {
-        let key = Preferences.indexToName(baseName, index)
-        guard let control = overrideControls[key] else { return }
-        switch baseName {
-        case "appearanceStyleOverride":
-            syncRadioButtons(control, to: Preferences.appearanceStyle.index)
-        case "appearanceSizeOverride":
-            if let segmented = control as? NSSegmentedControl {
-                segmented.selectedSegment = Preferences.appearanceSize.index
-                if let overlay = overrideProBadges[key] {
-                    AppearanceTab.refreshTrailingSegmentBadge(segmented, proIndex: AppearanceSizePreference.allCases.firstIndex(of: .auto)!, overlay: overlay)
-                }
-            }
-        case "appearanceThemeOverride":
-            (control as? NSSegmentedControl)?.selectedSegment = Preferences.appearanceTheme.index
-        case "shortcutStyleOverride":
-            if let segmented = control as? NSSegmentedControl {
-                segmented.selectedSegment = Preferences.shortcutStyle.index
-                if let overlay = overrideProBadges[key] {
-                    AppearanceTab.refreshTrailingSegmentBadge(segmented, proIndex: ShortcutStylePreference.allCases.firstIndex(of: .searchOnRelease)!, overlay: overlay)
-                }
-            }
-        case "previewFocusedWindowOverride":
-            (control as? Switch)?.setSilently(Preferences.previewSelectedWindow ? .on : .off)
         default: break
         }
+        gestureFilteringPane?.view.isHidden = segment != 0
+        gestureAppearancePane?.view.isHidden = segment != 1
+        gestureOrderingPane?.view.isHidden = segment != 2
     }
 
-    /// Resnap the 3 Pro-gated index-0 override controls to their currently-stored UserDefaults value.
-    /// Used after a Pro lock/unlock transition: `ProTransitionState.onProLockEngaged` writes
-    /// `appearanceStyleOverride` / etc. to the free equivalent, but the segmented/radio controls
-    /// still hold the user's pre-lock selection. Reading from UserDefaults catches them up.
-    private static func refreshGatedOverrideControlsFromStored() {
-        let styleKey = Preferences.indexToName("appearanceStyleOverride", 0)
-        if let style = overrideControls[styleKey] {
-            let stored = CachedUserDefaults.intFromMacroPref(styleKey, AppearanceStylePreference.allCases)
-            syncRadioButtons(style, to: stored)
-        }
-        let sizeKey = Preferences.indexToName("appearanceSizeOverride", 0)
-        if let size = overrideControls[sizeKey] as? NSSegmentedControl {
-            size.selectedSegment = CachedUserDefaults.intFromMacroPref(sizeKey, AppearanceSizePreference.allCases)
-            if let overlay = overrideProBadges[sizeKey] {
-                AppearanceTab.refreshTrailingSegmentBadge(size, proIndex: AppearanceSizePreference.allCases.firstIndex(of: .auto)!, overlay: overlay)
-            }
-        }
-        let shortcutStyleKey = Preferences.indexToName("shortcutStyleOverride", 0)
-        if let shortcutStyle = overrideControls[shortcutStyleKey] as? NSSegmentedControl {
-            shortcutStyle.selectedSegment = CachedUserDefaults.intFromMacroPref(shortcutStyleKey, ShortcutStylePreference.allCases)
-            if let overlay = overrideProBadges[shortcutStyleKey] {
-                AppearanceTab.refreshTrailingSegmentBadge(shortcutStyle, proIndex: ShortcutStylePreference.allCases.firstIndex(of: .searchOnRelease)!, overlay: overlay)
-            }
-        }
-    }
-
-    /// Iterate every override control and resnap the ones whose key isn't overridden to the global.
-    /// Called from `preferenceChanged` when a global appearance setting changes.
-    static func syncOverrideControlsToGlobal() {
-        for baseName in Preferences.appearanceOverrideBaseNames {
-            for index in 0...Preferences.maxShortcutCount {
-                if !Preferences.hasOverride(baseName, index) {
-                    syncOverrideControlToGlobal(baseName, index)
-                }
-            }
-        }
-    }
-
-    /// Show/hide each unlink button based on `hasOverride` for its key. Called after any override
-    /// or global change so the link/unlink affordance stays accurate.
-    private static func refreshUnlinkButtons() {
-        for (key, button) in unlinkButtons {
-            guard let (baseName, index) = parseOverrideKey(key) else { continue }
-            let shouldBeHidden = !Preferences.hasOverride(baseName, index)
-            if button.isHidden != shouldBeHidden {
-                button.isHidden = shouldBeHidden
-            }
-        }
-    }
-
-    private static func parseOverrideKey(_ key: String) -> (String, Int)? {
-        for baseName in Preferences.appearanceOverrideBaseNames {
-            for i in 0...Preferences.maxShortcutCount {
-                if Preferences.indexToName(baseName, i) == key { return (baseName, i) }
-            }
-        }
-        return nil
-    }
-
-    private static func isOverrideKey(_ key: String) -> Bool {
-        parseOverrideKey(key) != nil
-    }
-
-    private static func syncRadioButtons(_ view: NSView, to index: Int) {
-        guard let stack = view as? NSStackView else { return }
-        for (i, subview) in stack.arrangedSubviews.enumerated() {
-            if let buttonView = subview as? ImageTextButtonView {
-                buttonView.state = i == index ? .on : .off
-            } else if let button = subview as? NSButton {
-                button.state = i == index ? .on : .off
-            }
-        }
-    }
-
-    /// Called by `AppearanceTab.overrideInfoClicked` to deep-link from the global appearance row's
-    /// "Overridden in Shortcut: N" button. Selects the shortcut and switches the editor to the
-    /// Appearance segment.
-    static func selectShortcutAndShowAppearance(_ index: Int) {
-        selectedTabSegment = 1
-        selectShortcut(index)
-        // Apply tab selection to all shortcut editors so the appearance section is visible.
-        for (_, contents) in tabContentsByIndex {
-            contents.tabControl.selectedSegment = selectedTabSegment
-            for (i, pane) in contents.panes.enumerated() {
-                pane.isHidden = selectedTabSegment != i
-            }
-        }
-    }
-
-    private static func refreshShortcutControlsDisplay() {
-        shortcutControls.values.forEach {
-            $0.0.needsDisplay = true
-            $0.0.invalidateIntrinsicContentSize()
-        }
-    }
+    // MARK: - Selection
 
     private static func refreshShortcutUi() {
         if selectedShortcutIndex != gestureSelectionIndex {
@@ -854,25 +495,30 @@ class ControlsTab {
     private static func refreshShortcutRows() {
         guard let rows = shortcutRowsStackView else { return }
         setHoveredShortcutRow(nil)
+        let count = Preferences.shortcutCount
         clearArrangedSubviews(rows)
-        shortcutRows.removeAll(keepingCapacity: true)
-        for index in 0..<Preferences.shortcutCount {
-            let row = SidebarListRow()
+        // Recycle the row instances: grow/shrink the pool to `count`, creating new `SidebarListRow`s
+        // only when the count actually increases. Reusing instances avoids rebuilding the
+        // label/observer machinery on every refresh (this runs on +/- clicks, recorder edits,
+        // input-source changes, and the pro-lock observer). The search index is re-published below
+        // regardless, so added/removed rows stay correct.
+        while shortcutRows.count < count {
+            shortcutRows.append(makeShortcutRow(index: shortcutRows.count))
+        }
+        if shortcutRows.count > count {
+            shortcutRows.removeLast(shortcutRows.count - count)
+        }
+        for index in 0..<count {
+            let row = shortcutRows[index]
             row.setContent(shortcutTitle(index), shortcutSummary(index))
             row.setSelected(index == selectedShortcutIndex && selectedShortcutIndex != gestureSelectionIndex)
-            if index >= 1 {
-                row.setProBadge(true)
-            }
-            row.onClick = { _, _ in
-                selectShortcut(index)
-            }
-            row.onMouseEntered = { _, view in setHoveredShortcutRow(view as? SidebarListRow) }
-            row.onMouseExited = { _, _ in setHoveredShortcutRow(nil) }
+            row.setProBadge(index >= 1)
             rows.addArrangedSubview(row)
+            // Re-create the row↔stack width constraint each layout: AppKit drops it when the row is
+            // removed from the stack by `clearArrangedSubviews`. The row's height constraint is
+            // row-internal, set once in `makeShortcutRow`, and survives the remove/re-add cycle.
             row.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
-            row.heightAnchor.constraint(equalToConstant: sidebarRowHeight).isActive = true
-            shortcutRows.append(row)
-            if index < Preferences.shortcutCount - 1 {
+            if index < count - 1 {
                 let separator = sidebarSeparatorView()
                 rows.addArrangedSubview(separator)
                 separator.leadingAnchor.constraint(equalTo: rows.leadingAnchor, constant: TableGroupView.padding).isActive = true
@@ -881,15 +527,32 @@ class ControlsTab {
             }
         }
         syncShortcutSidebarHoverState()
+        // The rows were (re)built outside the section's build-time `indexed { }` scope, so their own
+        // `registerSearchContent` can't reach an active builder. Ask the window to re-publish the
+        // Controls section's dynamic search content from the current rows so a "sho" query keeps
+        // highlighting them. No-ops until `SettingsWindow.shared` is set (initial build is covered
+        // by `SettingsWindow.setupView`).
+        SettingsWindow.shared?.refreshSectionSearchContent("controls")
+    }
+
+    private static func makeShortcutRow(index: Int) -> SidebarListRow {
+        let row = SidebarListRow()
+        row.onClick = { _, _ in selectShortcut(index) }
+        row.onMouseEntered = { _, view in setHoveredShortcutRow(view as? SidebarListRow) }
+        row.onMouseExited = { _, _ in setHoveredShortcutRow(nil) }
+        row.heightAnchor.constraint(equalToConstant: sidebarRowHeight).isActive = true
+        return row
     }
 
     private static func refreshShortcutSelection() {
         shortcutRows.enumerated().forEach { $1.setSelected($0 == selectedShortcutIndex) }
-        shortcutEditorViews.enumerated().forEach { index, view in
-            view.isHidden = index != selectedShortcutIndex || index >= Preferences.shortcutCount
-        }
         gestureSidebarRow?.setSelected(selectedShortcutIndex == gestureSelectionIndex)
-        gestureEditorView?.isHidden = selectedShortcutIndex != gestureSelectionIndex
+        if selectedShortcutIndex == gestureSelectionIndex {
+            showEditor(forShortcut: false)
+        } else {
+            editor?.bind(toShortcut: selectedShortcutIndex)
+            showEditor(forShortcut: true)
+        }
     }
 
     private static func refreshShortcutCountButtons() {
@@ -974,46 +637,7 @@ class ControlsTab {
         }
     }
 
-    private static func initializeShortcutRecorderState(_ index: Int) {
-        guard index < Preferences.shortcutCount else { return }
-        let holdControlId = Preferences.indexToName("holdShortcut", index)
-        let nextControlId = Preferences.indexToName("nextWindowShortcut", index)
-        syncShortcutRecorderControlValue(holdControlId)
-        syncShortcutRecorderControlValue(nextControlId)
-        shortcutDropdownPreferences.forEach { syncShortcutDropdownControlValue(Preferences.indexToName($0, index)) }
-        if let holdShortcut = shortcutControls[holdControlId]?.0 {
-            shortcutChangedCallback(holdShortcut)
-        }
-        if let nextWindowShortcut = shortcutControls[nextControlId]?.0 {
-            shortcutChangedCallback(nextWindowShortcut)
-        }
-    }
-
-    private static func syncShortcutRecorderControlValue(_ controlId: String) {
-        guard let control = shortcutControls[controlId]?.0 else { return }
-        control.objectValue = Preferences.shortcut(controlId)
-    }
-
-    private static func syncShortcutDropdownControlValue(_ controlId: String) {
-        let index = Preferences.nameToIndex(controlId)
-        guard index < shortcutEditorViews.count else { return }
-        guard let dropdown = findDropdownControl(shortcutEditorViews[index], controlId) else { return }
-        guard dropdown.numberOfItems > 0 else { return }
-        let selectedIndex = UserDefaults.standard.string(forKey: controlId).flatMap(Int.init) ?? 0
-        dropdown.selectItem(at: min(max(0, selectedIndex), dropdown.numberOfItems - 1))
-    }
-
-    private static func findDropdownControl(_ root: NSView, _ controlId: String) -> NSPopUpButton? {
-        if let dropdown = root as? NSPopUpButton, dropdown.identifier?.rawValue == controlId {
-            return dropdown
-        }
-        for child in root.subviews {
-            if let found = findDropdownControl(child, controlId) {
-                return found
-            }
-        }
-        return nil
-    }
+    // MARK: - Shortcut row content (title + summary)
 
     private static func shortcutTitle(_ index: Int) -> String {
         return NSLocalizedString("Shortcut", comment: "") + " " + String(index + 1)
@@ -1022,25 +646,40 @@ class ControlsTab {
     private static func shortcutSummary(_ index: Int) -> String {
         let holdShortcut = Preferences.shortcut(Preferences.indexToName("holdShortcut", index))?.keyEquivalent ?? ""
         let nextWindowShortcut = Preferences.shortcut(Preferences.indexToName("nextWindowShortcut", index))?.keyEquivalent ?? ""
-        if nextWindowShortcut.isEmpty {
-            return holdShortcut
-        }
+        if nextWindowShortcut.isEmpty { return holdShortcut }
         return holdShortcut + " + " + nextWindowShortcut
     }
 
-    private static func gestureTitle() -> String {
-        return NSLocalizedString("Gesture", comment: "")
+    /// Refresh just the sidebar row's title + summary for one shortcut index. Called by the
+    /// recycled `TriggerBinding` after the user edits a recorder so the sidebar reflects the
+    /// new modifier + key combo immediately, without rebuilding the whole sidebar.
+    static func refreshShortcutRowContent(forIndex index: Int) {
+        guard index >= 0, index < shortcutRows.count else { return }
+        shortcutRows[index].setContent(shortcutTitle(index), shortcutSummary(index))
     }
 
-    private static func gestureSummary() -> String {
-        return Preferences.nextWindowGesture.localizedString
-    }
+    private static func gestureTitle() -> String { NSLocalizedString("Gesture", comment: "") }
+    private static func gestureSummary() -> String { Preferences.nextWindowGesture.localizedString }
 
     private static func refreshGestureRow() {
         guard let gestureSidebarRow else { return }
         gestureSidebarRow.setContent(gestureTitle(), gestureSummary())
         gestureSidebarRow.setSelected(selectedShortcutIndex == gestureSelectionIndex)
     }
+
+    /// Register the current sidebar rows (the shortcut rows + the persistent gesture row) into the
+    /// active search-index builder. Invoked by `SettingsWindow.refreshSectionSearchContent("controls")`
+    /// inside a fresh `indexed { }` scope — at build time and after every `refreshShortcutRows`. The
+    /// rows can't self-register at creation because they're (re)built outside the build scope; this
+    /// is the single place that publishes them, so a "sho" query lights up "Shortcut 1"/"Shortcut 2"
+    /// and "Gesture". Targets read the labels' `stringValue` live, so in-place content edits don't
+    /// need re-registration.
+    static func registerSidebarRowsSearchContent() {
+        shortcutRows.forEach { $0.registerSearchContent() }
+        gestureSidebarRow?.registerSearchContent()
+    }
+
+    // MARK: - Hover state
 
     private static func installShortcutSidebarHoverObserver(_ scrollView: NSScrollView) {
         if let shortcutRowsScrollObserver {
@@ -1075,9 +714,7 @@ class ControlsTab {
     private static func enclosingSidebarListRow(_ view: NSView?) -> SidebarListRow? {
         var current = view
         while let candidate = current {
-            if let row = candidate as? SidebarListRow {
-                return row
-            }
+            if let row = candidate as? SidebarListRow { return row }
             current = candidate.superview
         }
         return nil
@@ -1090,11 +727,28 @@ class ControlsTab {
         }
     }
 
+    // MARK: - Override key helpers (still needed for preferenceChanged routing)
+
+    private static func parseOverrideKey(_ key: String) -> (String, Int)? {
+        for baseName in Preferences.appearanceOverrideBaseNames {
+            for i in 0...Preferences.maxShortcutCount {
+                if Preferences.indexToName(baseName, i) == key { return (baseName, i) }
+            }
+        }
+        return nil
+    }
+
+    private static func isOverrideKey(_ key: String) -> Bool {
+        parseOverrideKey(key) != nil
+    }
+
     private static func isShortcutPreferenceKey(_ key: String) -> Bool {
         return (0..<Preferences.maxShortcutCount).contains(where: { index in
             ["holdShortcut", "nextWindowShortcut"].contains { key == Preferences.indexToName($0, index) }
         })
     }
+
+    // MARK: - Shortcut registry (global keyboard binding — unchanged from the old code)
 
     private static func applyActiveShortcutPreferences() {
         (0..<Preferences.maxShortcutCount).forEach { index in
@@ -1110,10 +764,12 @@ class ControlsTab {
     }
 
     @objc static func showShortcutsSettings() {
+        if shortcutsWhenActiveSheet == nil { shortcutsWhenActiveSheet = ShortcutsWhenActiveSheet() }
         SettingsWindow.shared.beginSheetWithSearchHighlight(shortcutsWhenActiveSheet)
     }
 
     @objc static func showAdditionalControlsSettings() {
+        if additionalControlsSheet == nil { additionalControlsSheet = AdditionalControlsSheet() }
         SettingsWindow.shared.beginSheetWithSearchHighlight(additionalControlsSheet)
     }
 
@@ -1134,19 +790,17 @@ class ControlsTab {
         KeyboardEvents.anyShortcutUsesEscape = shortcuts.values.contains { $0.shortcut.carbonKeyCode == kVK_Escape }
     }
 
+    /// Thin adapter over `NativeHotkeyResolver.resolve` — builds the snapshot inputs from the live
+    /// shortcut registry and applies the resolver's verdict via the symbolic-hotkey API. See
+    /// `NativeHotkeyResolverSpecs.md` for the kernel's invariants and #5653's root cause.
     static func toggleNativeCommandTabIfNeeded() {
-        let nativeHotkeys: [CGSSymbolicHotKey: (Shortcut) -> Bool] = [
-            .commandTab: { shortcut in shortcut.carbonModifierFlags == cmdKey && shortcut.carbonKeyCode == kVK_Tab },
-            .commandShiftTab: { shortcut in CustomRecorderControlTestable.combinedModifiersMatch(shortcut.carbonModifierFlags, UInt32(cmdKey | shiftKey)) && shortcut.carbonKeyCode == kVK_Tab },
-            .commandKeyAboveTab: { shortcut in shortcut.carbonModifierFlags == cmdKey && shortcut.carbonKeyCode == kVK_ANSI_Grave },
-        ]
-        var overlappingHotkeys = shortcuts.values.compactMap { atShortcut in nativeHotkeys.first { $1(atShortcut.shortcut) }?.key }
-        if overlappingHotkeys.contains(.commandTab) && !overlappingHotkeys.contains(.commandShiftTab) {
-            overlappingHotkeys.append(.commandShiftTab)
+        let snapshots = shortcuts.values.map { ShortcutSnapshot(modifiers: $0.shortcut.carbonModifierFlags, keyCode: $0.shortcut.carbonKeyCode) }
+        let holdShortcutModifiers: [UInt32] = (0..<Preferences.holdShortcut.count).compactMap { i in
+            shortcuts[Preferences.indexToName("holdShortcut", i)]?.shortcut.carbonModifierFlags
         }
-        let nonOverlappingHotkeys: [CGSSymbolicHotKey] = Array(Set(nativeHotkeys.keys).symmetricDifference(Set(overlappingHotkeys)))
-        setNativeCommandTabEnabled(false, overlappingHotkeys)
-        setNativeCommandTabEnabled(true, nonOverlappingHotkeys)
+        let result = NativeHotkeyResolver.resolve(shortcuts: snapshots, holdShortcutModifiers: holdShortcutModifiers)
+        setNativeCommandTabEnabled(false, Array(result.disable))
+        setNativeCommandTabEnabled(true, Array(result.enable))
     }
 
     @objc static func shortcutChangedCallback(_ sender: NSControl) {
@@ -1197,7 +851,42 @@ class ControlsTab {
     }
 
     @objc static func arrowKeysEnabledCallback(_ sender: NSControl) {
-        applyArrowKeysPreference()
+        if (sender as! Switch).state == .on {
+            if isClearArrowKeysSuccessful() {
+                arrowKeys.forEach { addShortcut(.down, .local, Shortcut(keyEquivalent: $0)!, $0, nil) }
+            } else {
+                (sender as! Switch).state = .off
+                Preferences.set("arrowKeysEnabled", "false", false)
+            }
+        } else {
+            arrowKeys.forEach { removeShortcutIfExists($0) }
+        }
+    }
+
+    private static func isClearArrowKeysSuccessful() -> Bool {
+        var conflicts = [String: String]()
+        shortcuts.forEach {
+            guard arrowKeyCodes.contains($1.shortcut.keyCode) else { return }
+            guard !arrowKeys.contains($1.id) else { return }
+            if let label = conflictLabel($1.id) {
+                conflicts[$1.id] = label
+            }
+        }
+        if !conflicts.isEmpty {
+            if SettingsWindow.shared == nil || !shouldClearConflictingShortcuts(conflicts.map { $0.value }, NSLocalizedString("Arrow keys already assigned to other actions:\n%@", comment: "")) {
+                return false
+            }
+            conflicts.forEach {
+                removeShortcutIfExists($0.key)
+                let existing = shortcutControls[$0.key]
+                if existing != nil {
+                    existing!.0.objectValue = nil
+                    shortcutChangedCallback(existing!.0)
+                    LabelAndControl.controlWasChanged(existing!.0, $0.key)
+                }
+            }
+        }
+        return true
     }
 
     @objc static func vimKeysEnabledCallback(_ sender: NSControl) {
@@ -1226,7 +915,7 @@ class ControlsTab {
             }
         }
         if !conflicts.isEmpty {
-            if SettingsWindow.shared == nil || !shouldClearConflictingShortcuts(conflicts.map { $0.value }) {
+            if SettingsWindow.shared == nil || !shouldClearConflictingShortcuts(conflicts.map { $0.value }, NSLocalizedString("Vim keys already assigned to other actions:\n%@", comment: "")) {
                 return false
             }
             conflicts.forEach {
@@ -1242,25 +931,45 @@ class ControlsTab {
         return true
     }
 
-    private static func conflictLabel(_ controlId: String) -> String? {
-        if let shortcutControl = shortcutControls[controlId] {
-            return shortcutControl.1
+    /// Human-readable label for the action bound to `id`, resolved purely from the model — the id's
+    /// shape plus `staticShortcutLabels` — NOT from `shortcutControls`. This is what lets the conflict
+    /// dialog name a shortcut that isn't currently displayed in the recycled editor (which keeps only
+    /// the on-screen shortcut in `shortcutControls`). Returns nil for ids with no known action.
+    ///
+    /// A numbered shortcut's hold and "and press" both belong to that shortcut's Trigger, so they
+    /// resolve to e.g. "Shortcut 2 - Trigger" — naming WHICH shortcut, since "Select next window"
+    /// alone doesn't disambiguate when several shortcuts exist.
+    static func conflictLabel(_ id: String) -> String? {
+        if arrowKeys.contains(id) { return NSLocalizedString("Arrow keys", comment: "") }
+        if vimKeyActions.values.contains(id) { return NSLocalizedString("Vim keys", comment: "") }
+        if id.hasPrefix("holdShortcut") || id.hasPrefix("nextWindowShortcut") {
+            return shortcutTitle(Preferences.nameToIndex(id)) + " - " + ShortcutEditor.triggerLabel
         }
-        if arrowKeys.contains(controlId) {
-            return NSLocalizedString("Arrow keys", comment: "")
-        }
-        if vimKeyActions.values.contains(controlId) {
-            return NSLocalizedString("Vim keys", comment: "")
-        }
-        return nil
+        return staticShortcutLabels[id]
     }
 
-    private static func shouldClearConflictingShortcuts(_ conflicts: [String]) -> Bool {
+    /// Clear the shortcut bound to `id` and let the normal preference-change pipeline reconcile the
+    /// registry and UI. Used by the conflict dialog's "Unassign existing shortcut and continue" for a
+    /// shortcut that may not be on screen, so it goes through `Preferences` (cached UserDefaults)
+    /// rather than mutating a live recorder. If that recorder happens to be displayed, sync it too.
+    ///
+    /// For a numbered shortcut's Trigger the hold can't stand alone, so "unassign" clears the "and
+    /// press" (nextWindowShortcut) part — e.g. ⌥+Tab becomes ⌥+(unassigned) — whether the conflict
+    /// was reported against the hold or the press.
+    static func unassignShortcut(_ id: String) {
+        let keyToClear = (id.hasPrefix("holdShortcut") || id.hasPrefix("nextWindowShortcut"))
+            ? Preferences.indexToName("nextWindowShortcut", Preferences.nameToIndex(id))
+            : id
+        Preferences.setShortcut(keyToClear, nil)
+        shortcutControls[keyToClear]?.0.objectValue = nil
+    }
+
+    private static func shouldClearConflictingShortcuts(_ conflicts: [String], _ messageFormat: String) -> Bool {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = NSLocalizedString("Conflicting shortcut", comment: "")
         let informativeText = conflicts.map { "• " + $0 }.joined(separator: "\n")
-        alert.informativeText = String(format: NSLocalizedString("Vim keys already assigned to other actions:\n%@", comment: ""), informativeText.replacingOccurrences(of: " ", with: "\u{00A0}"))
+        alert.informativeText = String(format: messageFormat, informativeText.replacingOccurrences(of: " ", with: "\u{00A0}"))
         alert.addButton(withTitle: NSLocalizedString("Unassign existing shortcut and continue", comment: "")).setAccessibilityFocused(true)
         let cancelButton = alert.addButton(withTitle: NSLocalizedString("Cancel", comment: ""))
         cancelButton.keyEquivalent = "\u{1b}"
@@ -1323,11 +1032,23 @@ class ControlsTab {
         return Shortcut(code: baseShortcut.keyCode, modifierFlags: [holdShortcut.modifierFlags, baseShortcut.modifierFlags], characters: baseShortcut.characters, charactersIgnoringModifiers: baseShortcut.charactersIgnoringModifiers)
     }
 
-    private static func applyArrowKeysPreference() {
-        if Preferences.arrowKeysEnabled {
-            arrowKeys.forEach { addShortcut(.down, .local, Shortcut(keyEquivalent: $0)!, $0, nil) }
-        } else {
+    private static func applyArrowKeysPreferenceWithoutDialogs() {
+        guard Preferences.arrowKeysEnabled else {
             arrowKeys.forEach { removeShortcutIfExists($0) }
+            return
+        }
+        if hasArrowKeysConflictWithoutUi() {
+            arrowKeys.forEach { removeShortcutIfExists($0) }
+            Preferences.set("arrowKeysEnabled", "false", false)
+            return
+        }
+        arrowKeys.forEach { addShortcut(.down, .local, Shortcut(keyEquivalent: $0)!, $0, nil) }
+    }
+
+    private static func hasArrowKeysConflictWithoutUi() -> Bool {
+        return shortcuts.values.contains {
+            guard arrowKeyCodes.contains($0.shortcut.keyCode) else { return false }
+            return !arrowKeys.contains($0.id)
         }
     }
 
@@ -1357,4 +1078,26 @@ class ControlsTab {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Trackpad-Settings.extension")!)
     }
 
+    // MARK: - Recorder lifecycle
+
+    private static func initializeShortcutRecorderState(_ index: Int) {
+        guard index < Preferences.shortcutCount else { return }
+        let holdControlId = Preferences.indexToName("holdShortcut", index)
+        let nextControlId = Preferences.indexToName("nextWindowShortcut", index)
+        if let holdShortcut = shortcutControls[holdControlId]?.0 {
+            holdShortcut.objectValue = Preferences.shortcut(holdControlId)
+            shortcutChangedCallback(holdShortcut)
+        }
+        if let nextWindowShortcut = shortcutControls[nextControlId]?.0 {
+            nextWindowShortcut.objectValue = Preferences.shortcut(nextControlId)
+            shortcutChangedCallback(nextWindowShortcut)
+        }
+    }
+
+    private static func refreshShortcutControlsDisplay() {
+        shortcutControls.values.forEach {
+            $0.0.needsDisplay = true
+            $0.0.invalidateIntrinsicContentSize()
+        }
+    }
 }

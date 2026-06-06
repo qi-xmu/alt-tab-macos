@@ -28,7 +28,7 @@
 "Alphabetical Order" = "Alphabetical Order";
 "AltTab crashed last time you used it. Sending a crash report will help get the issue fixed" = "AltTab crashed last time you used it. Sending a crash report will help get the issue fixed";
 "AltTab is a free, open-source window switcher for macOS. Pro features are available with a 14-day free trial." = "AltTab is a free, open-source window switcher for macOS. Pro features are available with a 14-day free trial.";
-"AltTab is running without Screen Recording permissions. Thumbnails won’t show." = "AltTab is running without Screen Recording permissions. Thumbnails won’t show.";
+"AltTab is running without Screen Recording permissions. %@ won’t show." = "AltTab is running without Screen Recording permissions. %@ won’t show.";
 "AltTab needs some permissions" = "AltTab needs some permissions";
 "AltTab Pro" = "AltTab Pro";
 "AltTab Pro adds 4 features beyond the free switcher." = "AltTab Pro adds 4 features beyond the free switcher.";
@@ -52,6 +52,7 @@
 "Application Name - Window Title" = "Application Name - Window Title";
 "Applies in other Appearances" = "Applies in other Appearances";
 "Arrow keys" = "Arrow keys";
+"Arrow keys already assigned to other actions:\n%@" = "Arrow keys already assigned to other actions:\n%@";
 "Ask whether to send crash reports" = "Ask whether to send crash reports";
 "Auto" = "Auto";
 "Auto Size — larger previews with few windows, more at once with many" = "Auto Size — larger previews with few windows, more at once with many";
@@ -239,6 +240,7 @@
 "Shortcut" = "Shortcut";
 "Shortcut %d" = "Shortcut %d";
 "Shortcut already assigned to another action: %@" = "Shortcut already assigned to another action: %@";
+"Shortcut already assigned to: %@" = "Shortcut already assigned to: %@";
 "Shortcuts When Active" = "Shortcuts When Active";
 "Shortcuts when active" = "Shortcuts when active";
 "Shortcuts when active…" = "Shortcuts when active…";
@@ -287,6 +289,7 @@
 "This will keep your Downloads folder uncluttered." = "This will keep your Downloads folder uncluttered.";
 "This will restart AltTab with default settings." = "This will restart AltTab with default settings.";
 "Thumbnails" = "Thumbnails";
+"Thumbnails and window previews" = "Thumbnails and window previews";
 "Title truncation" = "Title truncation";
 "Titles" = "Titles";
 "Titles appearance" = "Titles appearance";
@@ -324,6 +327,7 @@
 "Window is on every Space" = "Window is on every Space";
 "Window is on Space %d" = "Window is on Space %d";
 "Window Style" = "Window Style";
+"Window previews" = "Window previews";
 "window switches" = "window switches";
 "Window Title" = "Window Title";
 "Window title contains" = "Window title contains";

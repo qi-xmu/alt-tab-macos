@@ -72,7 +72,7 @@ class SystemPermissions {
             }
         }
         DispatchQueue.main.async {
-            Menubar.togglePermissionCallout(ScreenRecordingPermission.status != .granted)
+            Menubar.refreshPermissionCallout()
             if PermissionsWindow.shared != nil {
                 PermissionsWindow.updatePermissionViews()
             }

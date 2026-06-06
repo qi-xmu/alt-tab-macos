@@ -28,7 +28,7 @@
 "Alphabetical Order" = "알파벳 순서";
 "AltTab crashed last time you used it. Sending a crash report will help get the issue fixed" = "AltTab이 마지막 사용 시 충돌했습니다. 충돌 보고서를 보내면 문제 해결에 도움이 됩니다";
 "AltTab is a free, open-source window switcher for macOS. Pro features are available with a 14-day free trial." = "AltTab은 macOS용 무료 오픈 소스 윈도우 전환기입니다. Pro 기능은 14일 무료 체험으로 이용할 수 있습니다.";
-"AltTab is running without Screen Recording permissions. Thumbnails won’t show." = "AltTab이 화면 녹화 권한 없이 실행 중입니다. 썸네일이 표시되지 않습니다.";
+"AltTab is running without Screen Recording permissions. %@ won’t show." = "AltTab이 화면 녹화 권한 없이 실행 중입니다. %@이(가) 표시되지 않습니다.";
 "AltTab needs some permissions" = "AltTab에 몇 가지 권한이 필요합니다";
 "AltTab Pro" = "AltTab Pro";
 "AltTab Pro adds 4 features beyond the free switcher." = "AltTab Pro는 무료 전환기에 4가지 기능을 추가합니다.";
@@ -52,6 +52,7 @@
 "Application Name - Window Title" = "응용 프로그램 이름 - 윈도우 제목";
 "Applies in other Appearances" = "다른 모양에도 적용됨";
 "Arrow keys" = "화살표 키";
+"Arrow keys already assigned to other actions:\n%@" = "화살표 키가 이미 다른 동작에 할당되어 있습니다:\n%@";
 "Ask whether to send crash reports" = "충돌 보고서 전송 여부 물어보기";
 "Auto" = "자동";
 "Auto Size — larger previews with few windows, more at once with many" = "자동 크기 — 윈도우가 적으면 미리보기가 크고, 많으면 한 번에 더 많이 표시";
@@ -217,7 +218,7 @@
 "Settings imported" = "설정을 가져왔습니다";
 "Settings…" = "설정…";
 "Shortcut" = "단축키";
-"Shortcut already assigned to another action: %@" = "단축키가 이미 다른 동작에 할당되어 있습니다: %@";
+"Shortcut already assigned to: %@" = "단축키가 이미 할당되어 있습니다: %@";
 "Shortcuts When Active" = "활성 시 단축키";
 "Shortcuts when active…" = "활성 시 단축키…";
 "Show" = "보이기";
@@ -265,6 +266,7 @@
 "This permission is needed to show thumbnails and preview of open windows" = "열린 윈도우의 썸네일 및 미리보기를 표시하려면 이 권한이 필요합니다";
 "This will keep your Downloads folder uncluttered." = "다운로드 폴더를 깔끔하게 유지할 수 있습니다.";
 "Thumbnails" = "썸네일";
+"Thumbnails and window previews" = "썸네일 및 윈도우 미리보기";
 "Title truncation" = "제목 자르기";
 "Titles" = "제목";
 "Titles appearance" = "제목 모양";
@@ -299,6 +301,7 @@
 "Window is minimized" = "윈도우 최소화됨";
 "Window is on every Space" = "윈도우가 모든 Space에 있음";
 "Window is on Space %d" = "윈도우가 Space %d에 있음";
+"Window previews" = "윈도우 미리보기";
 "window switches" = "회 윈도우 전환";
 "Window Title" = "윈도우 제목";
 "Window title contains" = "윈도우 제목 포함";

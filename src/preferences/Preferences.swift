@@ -62,7 +62,7 @@ class Preferences {
             values[indexToName("showWindowlessApps", index)] = ShowHowPreference.showAtTheEnd.indexAsString
             values[indexToName("windowOrder", index)] = WindowOrderPreference.recentlyFocused.indexAsString
             values[indexToName("shortcutStyle", index)] = ShortcutStylePreference.focusOnRelease.indexAsString
-            values[indexToName("showAppsOrWindows", index)] = ShowAppsOrWindowsPreference.windows.indexAsString
+            values[indexToName("showAppsOrWindows", index)] = GroupAppsPreference.allWindows.indexAsString
             values[indexToName("showTabsAsWindows", index)] = GroupTabsPreference.singleWindow.indexAsString
             // Override defaults are the FREE-tier value for Pro-gated prefs (so `snapshotAndDowngrade`
             // is a no-op for unset overrides), and the global default for non-gated prefs.
@@ -150,8 +150,7 @@ class Preferences {
     static func showFullscreenWindows(_ i: Int) -> ShowHowPreference { CachedUserDefaults.macroPref(indexToName("showFullscreenWindows", i), ShowHowPreference.allCases) }
     static func showWindowlessApps(_ i: Int) -> ShowHowPreference { CachedUserDefaults.macroPref(indexToName("showWindowlessApps", i), ShowHowPreference.allCases) }
     static func windowOrder(_ i: Int) -> WindowOrderPreference { CachedUserDefaults.macroPref(indexToName("windowOrder", i), WindowOrderPreference.allCases) }
-    static var showAppsOrWindows: [ShowAppsOrWindowsPreference] { (0...maxShortcutCount).map { CachedUserDefaults.macroPref(indexToName("showAppsOrWindows", $0), ShowAppsOrWindowsPreference.allCases) } }
-    static func showAppsOrWindows(_ i: Int) -> ShowAppsOrWindowsPreference { CachedUserDefaults.macroPref(indexToName("showAppsOrWindows", i), ShowAppsOrWindowsPreference.allCases) }
+    static func groupApps(_ i: Int) -> GroupAppsPreference { CachedUserDefaults.macroPref(indexToName("showAppsOrWindows", i), GroupAppsPreference.allCases) }
     static func groupTabs(_ i: Int) -> GroupTabsPreference { CachedUserDefaults.macroPref(indexToName("showTabsAsWindows", i), GroupTabsPreference.allCases) }
     static var shortcutStyle: ShortcutStylePreference { ProGatedPreferences.shortcutStyle.read() }
     static var menubarIcon: MenubarIconPreference { CachedUserDefaults.macroPref("menubarIcon", MenubarIconPreference.allCases) }
@@ -248,8 +247,8 @@ class Preferences {
         cachedAll = nil
     }
 
-    static func onlyShowApplications(_ index: Int = SwitcherSession.activeShortcutIndex) -> Bool {
-        return showAppsOrWindows(index) == .applications && effectiveAppearanceStyle(index) != .thumbnails
+    static func onlyShowMainWindows(_ index: Int = SwitcherSession.activeShortcutIndex) -> Bool {
+        return groupApps(index) == .mainWindow
     }
 
     // MARK: - Per-shortcut appearance overrides
@@ -335,6 +334,24 @@ class Preferences {
     static func effectivePreviewSelectedWindow(_ index: Int) -> Bool {
         guard hasOverride("previewFocusedWindowOverride", index) else { return previewSelectedWindow }
         return CachedUserDefaults.bool(indexToName("previewFocusedWindowOverride", index))
+    }
+
+    /// Which Screen-Recording-dependent features any shortcut's effective settings rely on: the
+    /// Thumbnails appearance style (window screenshots) and/or the "preview selected window" overlay.
+    /// These are the only features needing the permission, so when none are configured the menubar
+    /// callout that nags about the missing permission is pointless and is suppressed (see #5623). The
+    /// result also drives which feature(s) the callout names. We OR each flag across every shortcut
+    /// slot, so a per-shortcut override that enables Thumbnails/Preview on any one slot flips it on.
+    /// The pure classification lives in `PermissionCalloutResolver` (unit-tested).
+    static var screenRecordingDependentFeatures: PermissionCalloutResolver.DependentFeatures {
+        var usesThumbnails = false
+        var usesPreviews = false
+        for index in 0...maxShortcutCount {
+            usesThumbnails = usesThumbnails || effectiveAppearanceStyle(index) == .thumbnails
+            usesPreviews = usesPreviews || effectivePreviewSelectedWindow(index)
+            if usesThumbnails && usesPreviews { break }
+        }
+        return PermissionCalloutResolver.dependentFeatures(usesThumbnails: usesThumbnails, usesPreviews: usesPreviews)
     }
 
     /// key-above-tab is ` on US keyboard, but can be different on other keyboards
