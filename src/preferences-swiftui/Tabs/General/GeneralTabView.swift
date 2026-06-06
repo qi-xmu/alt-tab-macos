@@ -181,15 +181,36 @@ struct GeneralTabView: View {
 
     // MARK: - Language row
 
+    private var languageBinding: Binding<LanguagePreference> {
+        Binding(
+            get: { CachedUserDefaults.macroPref("language", LanguagePreference.allCases) },
+            set: { newValue in
+                if newValue == .systemDefault {
+                    UserDefaults.standard.removeObject(forKey: "AppleLanguages")
+                } else {
+                    UserDefaults.standard.set([newValue.appleLanguageCode!], forKey: "AppleLanguages")
+                }
+                Preferences.set("language", newValue.indexAsString)
+                store.refreshToken = UUID()
+                showLanguageRestartAlert()
+            }
+        )
+    }
+
+    private func showLanguageRestartAlert() {
+        let alert = NSAlert()
+        alert.messageText = NSLocalizedString("Language Change", comment: "")
+        alert.informativeText = NSLocalizedString("The application needs to restart to apply the language change.", comment: "")
+        alert.addButton(withTitle: NSLocalizedString("Restart Now", comment: ""))
+        alert.addButton(withTitle: NSLocalizedString("Later", comment: ""))
+        if alert.runModal() == .alertFirstButtonReturn {
+            App.restart()
+        }
+    }
+
     private var languageRow: some View {
         LabeledRow(NSLocalizedString("Language", comment: "")) {
-            Picker(
-                "",
-                selection: store.macroBinding(
-                    for: "language",
-                    LanguagePreference.allCases
-                )
-            ) {
+            Picker("", selection: languageBinding) {
                 ForEach(LanguagePreference.allCases, id: \.self) { lang in
                     Text(lang.localizedString).tag(lang)
                 }
